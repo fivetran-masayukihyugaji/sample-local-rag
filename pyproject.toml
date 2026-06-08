@@ -13,6 +13,7 @@ dependencies = [
   "pandas",
   "numpy",
   "pylate",
+  "duckdb",
 ]
 
 [tool.uv]

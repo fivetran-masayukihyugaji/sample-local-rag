@@ -9,6 +9,7 @@ import gradio as gr
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextIteratorStreamer
 from threading import Thread
+import duckdb
 
 # PyLate (Late Interaction: ColBERT + PLAID index)
 from pylate import indexes, models, retrieve
@@ -16,7 +17,7 @@ from pylate import indexes, models, retrieve
 # ===== Settings =====
 EMBED_MODEL_NAME = os.environ.get("EMBED_MODEL_NAME", "LiquidAI/LFM2-ColBERT-350M")
 HF_CHAT_MODEL = os.environ.get("HF_CHAT_MODEL", "LiquidAI/LFM2-1.2B-RAG")
-TOP_K = int(os.environ.get("TOP_K", "1"))
+TOP_K = int(os.environ.get("TOP_K", "20"))
 SERVER_PORT = int(os.environ.get("GRADIO_SERVER_PORT", os.environ.get("PORT", "7860")))
 
 # PyLate Index settings
@@ -75,33 +76,66 @@ def _save_id2text(mapping: dict[str, str]) -> None:
     with p.open("w", encoding="utf-8") as f:
         json.dump(mapping, f, ensure_ascii=False)
 
-def rebuild_pylate_index() -> str:
-    """
-    Build/overwrite PyLate index from input.csv (expects id, text columns).
-    Also writes id->text mapping to pylate-index/id2text.json for retrieval display.
-    """
-    if not INPUT_CSV.exists():
-        return "エラー: input.csv が見つかりません。CSVを用意するか、Data Prepタブで作成してください。"
-    try:
-        df = pd.read_csv(INPUT_CSV)
-    except Exception as e:
-        return f"input.csv の読み込みに失敗しました: {e}"
+def get_duckdb_con(client_id, client_secret, oauth_uri, catalog_name, endpoint, s3_region):
+    con = duckdb.connect()
+    con.execute("INSTALL iceberg;")
+    con.execute("LOAD iceberg;")
+    con.execute("INSTALL httpfs;")
+    con.execute("LOAD httpfs;")
+    
+    con.execute(f"""
+    CREATE SECRET polaris_secret (
+        TYPE iceberg,
+        CLIENT_ID '{client_id}',
+        CLIENT_SECRET '{client_secret}',
+        OAUTH2_SERVER_URI '{oauth_uri}'
+    );
+    """)
+    con.execute(f"""
+    ATTACH '{catalog_name}' AS mdls_s3 (
+            TYPE iceberg,
+            SECRET polaris_secret,
+            ENDPOINT '{endpoint}',
+            DEFAULT_REGION '{s3_region}'
+    );
+    """)
+    con.execute(f"SET s3_region='{s3_region}';")
+    return con
 
-    if not {"id", "text"}.issubset(df.columns):
-        return "エラー: input.csv は少なくとも 'id' と 'text' 列を含む必要があります。"
+def load_iceberg_preview(client_id, client_secret, oauth_uri, catalog_name, endpoint, s3_region, table_name):
+    try:
+        con = get_duckdb_con(client_id, client_secret, oauth_uri, catalog_name, endpoint, s3_region)
+        df = con.execute(f"SELECT * FROM {table_name} LIMIT 10;").df()
+        return df, "プレビューを読み込みました。"
+    except Exception as e:
+        return pd.DataFrame(), f"プレビュー読み込みエラー: {e}"
+
+def rebuild_pylate_index_from_iceberg(client_id, client_secret, oauth_uri, catalog_name, endpoint, s3_region, table_name, id_col, text_col):
+    if not client_id or not client_secret:
+         return "エラー: Client ID と Client Secret を入力してください。"
+    try:
+        con = get_duckdb_con(client_id, client_secret, oauth_uri, catalog_name, endpoint, s3_region)
+        df = con.execute(f"SELECT {id_col} AS id, {text_col} AS text FROM {table_name};").df()
+    except Exception as e:
+        return f"Icebergからのデータ読み込みエラー: {e}"
 
     df = df.dropna(subset=["id", "text"])
     try:
-        ids = [str(int(i)) for i in df["id"].tolist()]
+        # id列を文字列として取得
+        try:
+            ids = [str(int(i)) for i in df["id"].tolist()]
+        except Exception:
+            ids = [str(i) for i in df["id"].tolist()]
     except Exception:
-        return "エラー: 'id' 列は整数に変換できる値である必要があります。"
+        return "エラー: 'id' 列のパースに失敗しました。"
+        
     documents = df["text"].astype(str).tolist()
 
     if len(ids) == 0:
-        return "エラー: 有効な行がありません（空のCSV）。"
+        return "エラー: 有効な行がありません（空のテーブル、または指定したカラムが不正）。"
 
     try:
-        index = _get_plaid_index(override=True)  # overwrite existing index if any
+        index = _get_plaid_index(override=True)
         documents_embeddings = colbert_model.encode(
             documents,
             batch_size=ENCODE_BATCH,
@@ -112,7 +146,6 @@ def rebuild_pylate_index() -> str:
             documents_ids=ids,
             documents_embeddings=documents_embeddings,
         )
-        # save id->text mapping
         _save_id2text({i: t for i, t in zip(ids, documents)})
         return f"PyLateインデックス再構築完了: {len(documents)} 文書 -> {INDEX_FOLDER}/{INDEX_NAME}"
     except Exception as e:
@@ -358,7 +391,7 @@ def _retrieve_with_pylate(query: str, top_k: int = TOP_K):
         index = _get_plaid_index(override=False)
         retriever = retrieve.ColBERT(index=index)
     except Exception as e:
-        raise RuntimeError(f"インデックスの読み込みに失敗しました。先に『PyLate インデックスを再構築』を実行してください。詳細: {e}")
+        raise RuntimeError(f"インデックスの読み込みに失敗しました。先にIceberg Data Prepタブから『PyLate インデックスを再構築』を実行してください。詳細: {e}")
 
     try:
         queries_embeddings = colbert_model.encode(
@@ -389,7 +422,7 @@ def rag_infer(user_query: str, top_k: int, consent_download: bool):
         retrieved_texts, top_scores = _retrieve_with_pylate(user_query, top_k=int(top_k))
     except Exception as e:
         return (
-            "検索中にエラーが発生しました。input.csv を用意し、"
+            "検索中にエラーが発生しました。Iceberg Data Prepタブから"
             "『PyLate インデックスを再構築』を実行してください。\n"
             f"詳細: {e}",
             ""
@@ -441,89 +474,50 @@ def rag_infer(user_query: str, top_k: int, consent_download: bool):
     except Exception as e_gen:
         yield f"生成中にエラーが発生しました: {e_gen}", logs
 
-# ===== Data Prep（CSVアップロード/編集/保存 → PyLateインデックス再構築） =====
-def _ensure_dataframe(df) -> pd.DataFrame:
-    if isinstance(df, pd.DataFrame):
-        return df
-    try:
-        return pd.DataFrame(df)
-    except Exception:
-        return pd.DataFrame(columns=["id", "text"])
-
-def load_uploaded_csv(file_path: str) -> pd.DataFrame:
-    """アップロードCSVを読み込んで表示用DataFrameを返す"""
-    try:
-        if not file_path:
-            return pd.DataFrame(columns=["id", "text"])
-        df = pd.read_csv(file_path)
-        return df
-    except Exception:
-        return pd.DataFrame(columns=["id", "text"])
-
-def load_current_csv() -> pd.DataFrame:
-    """プロジェクト内の input.csv を読み込んで表示。存在しなければ空DF"""
-    if INPUT_CSV.exists():
-        try:
-            df = pd.read_csv(INPUT_CSV)
-            return df
-        except Exception:
-            return pd.DataFrame(columns=["id", "text"])
-    return pd.DataFrame(columns=["id", "text"])
-
-def save_csv_and_load_df(df) -> str:
-    """編集結果のDataFrameを input.csv に保存"""
-    df = _ensure_dataframe(df)
-    if not {"id", "text"}.issubset(df.columns):
-        return "エラー: DataFrameは少なくとも 'id' と 'text' 列を含む必要があります。"
-
-    df = df.dropna(subset=["id", "text"])
-    try:
-        df["id"] = df["id"].astype(int)
-    except Exception:
-        return "エラー: 'id' 列は整数に変換できる必要があります。"
-
-    try:
-        df.to_csv(INPUT_CSV, index=False, encoding="utf-8")
-    except Exception as e:
-        return f"input.csv の保存に失敗しました: {e}"
-
-    return f"保存完了: input.csv（{len(df)}行）。次に『PyLate インデックスを再構築』を実行してください。"
+# ===== Data Prep (Iceberg/Polaris) =====
 
 # ===== Gradio app =====
 with gr.Blocks(title="ローカルRAGデモ（PyLate + HF Transformers）") as demo:
     with gr.Tabs():
-        with gr.Tab("Data Prep"):
+        with gr.Tab("Iceberg Data Prep"):
             gr.Markdown(
                 """
-                ## CSV前処理（アップロード/閲覧/編集 → input.csv 保存 → PyLateインデックス）
-                - CSVをアップロードして内容を確認・編集できます（最低限 id, text 列が必要）
-                - 「保存」で input.csv を更新
-                - 「PyLate インデックスを再構築」で検索用インデックスを再生成（pylate-index/）
+                ## Polaris/Iceberg連携
+                - PolarisカタログおよびIcebergテーブルに接続し、RAG用のデータをロードしてPyLateインデックスを構築します。
+                - 対象テーブルには必ず一意なID列と、テキストを格納した列が必要です。
                 """
             )
             with gr.Row():
-                up = gr.File(label="CSVアップロード（.csv）", file_types=[".csv"], type="filepath")
-                #load_current_btn = gr.Button("現在の input.csv を読み込み")
-
-            df_comp = gr.Dataframe(
-                headers=["id", "text"],
-                interactive=True,
-                row_count=(3, "dynamic"),
-                label="CSV内容（編集可）"
-            )
+                with gr.Column():
+                    client_id = gr.Textbox(label="Client ID")
+                    client_secret = gr.Textbox(label="Client Secret", type="password")
+                    oauth_uri = gr.Textbox(label="OAuth2 Server URI", value="https://alumni-glowworm.ap-southeast-2.aws.polaris.fivetran.com/api/catalog/v1/oauth/tokens")
+                    catalog_name = gr.Textbox(label="Catalog Name", value="insist_underneath")
+                with gr.Column():
+                    endpoint = gr.Textbox(label="Endpoint", value="https://alumni-glowworm.ap-southeast-2.aws.polaris.fivetran.com/api/catalog/")
+                    s3_region = gr.Textbox(label="S3 Region", value="ap-southeast-2")
+                    table_name = gr.Textbox(label="Table Name", value="mdls_s3.mhyugaji_oracle_csg_apac_hyugaji.jaffle_shop_customers")
+                    with gr.Row():
+                        id_col = gr.Textbox(label="ID Column Name", value="id")
+                        text_col = gr.Textbox(label="Text Column Name", value="text")
 
             with gr.Row():
-                save_btn = gr.Button("保存")
+                preview_btn = gr.Button("Preview (10件ロード)")
                 index_btn = gr.Button("PyLate インデックスを再構築")
 
-            prep_status = gr.Textbox(label="前処理ステータス/メッセージ", lines=6)
-            index_logs = gr.Textbox(label="インデックス構築ログ", lines=12)
+            prep_status = gr.Textbox(label="ステータス/メッセージ", lines=3)
+            df_comp = gr.Dataframe(label="プレビューデータ", interactive=False)
 
-            # Events
-            up.change(load_uploaded_csv, inputs=up, outputs=df_comp)
-            #load_current_btn.click(load_current_csv, inputs=None, outputs=df_comp)
-            save_btn.click(save_csv_and_load_df, inputs=df_comp, outputs=prep_status)
-            index_btn.click(rebuild_pylate_index, inputs=None, outputs=index_logs)
+            preview_btn.click(
+                load_iceberg_preview, 
+                inputs=[client_id, client_secret, oauth_uri, catalog_name, endpoint, s3_region, table_name], 
+                outputs=[df_comp, prep_status]
+            )
+            index_btn.click(
+                rebuild_pylate_index_from_iceberg,
+                inputs=[client_id, client_secret, oauth_uri, catalog_name, endpoint, s3_region, table_name, id_col, text_col],
+                outputs=[prep_status]
+            )
 
         with gr.Tab("RAG"):
             gr.Markdown(
